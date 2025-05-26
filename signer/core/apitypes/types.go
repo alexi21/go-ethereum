@@ -18,7 +18,6 @@ package apitypes
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -92,7 +91,6 @@ type SendTxArgs struct {
 	MaxPriorityFeePerGas *hexutil.Big             `json:"maxPriorityFeePerGas"`
 	Value                hexutil.Big              `json:"value"`
 	Nonce                hexutil.Uint64           `json:"nonce"`
-
 	// We accept "data" and "input" for backwards-compatibility reasons.
 	// "input" is the newer name and should be preferred by clients.
 	// Issue detail: https://github.com/ethereum/go-ethereum/issues/15628
@@ -133,16 +131,14 @@ func (args *SendTxArgs) data() []byte {
 }
 
 // ToTransaction converts the arguments to a transaction.
-func (args *SendTxArgs) ToTransaction() (*types.Transaction, error) {
+func (args *SendTxArgs) ToTransaction() *types.Transaction {
 	// Add the To-field, if specified
 	var to *common.Address
 	if args.To != nil {
 		dstAddr := args.To.Address()
 		to = &dstAddr
 	}
-	if err := args.validateTxSidecar(); err != nil {
-		return nil, err
-	}
+
 	var data types.TxData
 	switch {
 	case args.BlobHashes != nil:
@@ -208,78 +204,7 @@ func (args *SendTxArgs) ToTransaction() (*types.Transaction, error) {
 			Data:     args.data(),
 		}
 	}
-
-	return types.NewTx(data), nil
-}
-
-// validateTxSidecar validates blob data, if present
-func (args *SendTxArgs) validateTxSidecar() error {
-	// No blobs, we're done.
-	if args.Blobs == nil {
-		return nil
-	}
-
-	n := len(args.Blobs)
-	// Assume user provides either only blobs (w/o hashes), or
-	// blobs together with commitments and proofs.
-	if args.Commitments == nil && args.Proofs != nil {
-		return errors.New(`blob proofs provided while commitments were not`)
-	} else if args.Commitments != nil && args.Proofs == nil {
-		return errors.New(`blob commitments provided while proofs were not`)
-	}
-
-	// len(blobs) == len(commitments) == len(proofs) == len(hashes)
-	if args.Commitments != nil && len(args.Commitments) != n {
-		return fmt.Errorf("number of blobs and commitments mismatch (have=%d, want=%d)", len(args.Commitments), n)
-	}
-	if args.Proofs != nil && len(args.Proofs) != n {
-		return fmt.Errorf("number of blobs and proofs mismatch (have=%d, want=%d)", len(args.Proofs), n)
-	}
-	if args.BlobHashes != nil && len(args.BlobHashes) != n {
-		return fmt.Errorf("number of blobs and hashes mismatch (have=%d, want=%d)", len(args.BlobHashes), n)
-	}
-
-	if args.Commitments == nil {
-		// Generate commitment and proof.
-		commitments := make([]kzg4844.Commitment, n)
-		proofs := make([]kzg4844.Proof, n)
-		for i, b := range args.Blobs {
-			c, err := kzg4844.BlobToCommitment(&b)
-			if err != nil {
-				return fmt.Errorf("blobs[%d]: error computing commitment: %v", i, err)
-			}
-			commitments[i] = c
-			p, err := kzg4844.ComputeBlobProof(&b, c)
-			if err != nil {
-				return fmt.Errorf("blobs[%d]: error computing proof: %v", i, err)
-			}
-			proofs[i] = p
-		}
-		args.Commitments = commitments
-		args.Proofs = proofs
-	} else {
-		for i, b := range args.Blobs {
-			if err := kzg4844.VerifyBlobProof(&b, args.Commitments[i], args.Proofs[i]); err != nil {
-				return fmt.Errorf("failed to verify blob proof: %v", err)
-			}
-		}
-	}
-
-	hashes := make([]common.Hash, n)
-	hasher := sha256.New()
-	for i, c := range args.Commitments {
-		hashes[i] = kzg4844.CalcBlobHashV1(hasher, &c)
-	}
-	if args.BlobHashes != nil {
-		for i, h := range hashes {
-			if h != args.BlobHashes[i] {
-				return fmt.Errorf("blob hash verification failed (have=%s, want=%s)", args.BlobHashes[i], h)
-			}
-		}
-	} else {
-		args.BlobHashes = hashes
-	}
-	return nil
+	return types.NewTx(data)
 }
 
 type SigFormat struct {
@@ -325,11 +250,9 @@ type Type struct {
 	Type string `json:"type"`
 }
 
-// isArray returns true if the type is a fixed or variable sized array.
-// This method may return false positives, in case the Type is not a valid
-// expression, e.g. "fooo[[[[".
+// isArray returns true if the type is a fixed or variable sized array
 func (t *Type) isArray() bool {
-	return strings.IndexByte(t.Type, '[') > 0
+	return len(strings.Split(t.Type, "[")) > 1
 }
 
 // typeName returns the canonical name of the type. If the type is 'Person[]' or 'Person[2]', then
@@ -685,7 +608,7 @@ func (typedData *TypedData) EncodePrimitiveValue(encType string, encValue interf
 		if err != nil {
 			return nil, err
 		}
-		return math.U256Bytes(new(big.Int).Set(b)), nil
+		return math.U256Bytes(b), nil
 	}
 	return nil, fmt.Errorf("unrecognized type '%s'", encType)
 }
@@ -869,36 +792,34 @@ func (t Types) validate() error {
 	return nil
 }
 
-var validPrimitiveTypes = map[string]struct{}{}
-
-// build the set of valid primitive types
-func init() {
-	// Types those are trivially valid
-	for _, t := range []string{
-		"address", "address[]", "bool", "bool[]", "string", "string[]",
-		"bytes", "bytes[]", "int", "int[]", "uint", "uint[]",
-	} {
-		validPrimitiveTypes[t] = struct{}{}
+// Checks if the primitive value is valid
+func isPrimitiveTypeValid(primitiveType string) bool {
+	primitiveType = strings.Split(primitiveType, "[")[0]
+	if primitiveType == "address" ||
+		primitiveType == "bool" ||
+		primitiveType == "string" ||
+		primitiveType == "bytes" ||
+		primitiveType == "int" ||
+		primitiveType == "uint" {
+		return true
 	}
 	// For 'bytesN', 'bytesN[]', we allow N from 1 to 32
 	for n := 1; n <= 32; n++ {
-		validPrimitiveTypes[fmt.Sprintf("bytes%d", n)] = struct{}{}
-		validPrimitiveTypes[fmt.Sprintf("bytes%d[]", n)] = struct{}{}
+		// e.g. 'bytes28' or 'bytes28[]'
+		if primitiveType == fmt.Sprintf("bytes%d", n) || primitiveType == fmt.Sprintf("bytes%d[]", n) {
+			return true
+		}
 	}
 	// For 'intN','intN[]' and 'uintN','uintN[]' we allow N in increments of 8, from 8 up to 256
 	for n := 8; n <= 256; n += 8 {
-		validPrimitiveTypes[fmt.Sprintf("int%d", n)] = struct{}{}
-		validPrimitiveTypes[fmt.Sprintf("int%d[]", n)] = struct{}{}
-		validPrimitiveTypes[fmt.Sprintf("uint%d", n)] = struct{}{}
-		validPrimitiveTypes[fmt.Sprintf("uint%d[]", n)] = struct{}{}
+		if primitiveType == fmt.Sprintf("int%d", n) || primitiveType == fmt.Sprintf("int%d[]", n) {
+			return true
+		}
+		if primitiveType == fmt.Sprintf("uint%d", n) || primitiveType == fmt.Sprintf("uint%d[]", n) {
+			return true
+		}
 	}
-}
-
-// Checks if the primitive value is valid
-func isPrimitiveTypeValid(primitiveType string) bool {
-	input := strings.Split(primitiveType, "[")[0]
-	_, ok := validPrimitiveTypes[input]
-	return ok
+	return false
 }
 
 // validate checks if the given domain is valid, i.e. contains at least
