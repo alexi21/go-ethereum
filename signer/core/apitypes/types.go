@@ -24,6 +24,7 @@ import (
 	"math/big"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,6 +35,8 @@ import (
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
+	"github.com/holiman/uint256"
 )
 
 var typedDataReferenceTypeRegexp = regexp.MustCompile(`^[A-Za-z](\w*)(\[\d*\])*$`)
@@ -62,10 +65,10 @@ func (vs *ValidationMessages) Info(msg string) {
 	vs.Messages = append(vs.Messages, ValidationInfo{INFO, msg})
 }
 
-// getWarnings returns an error with all messages of type WARN of above, or nil if no warnings were present
-func (v *ValidationMessages) GetWarnings() error {
+// GetWarnings returns an error with all messages of type WARN of above, or nil if no warnings were present
+func (vs *ValidationMessages) GetWarnings() error {
 	var messages []string
-	for _, msg := range v.Messages {
+	for _, msg := range vs.Messages {
 		if msg.Typ == WARN || msg.Typ == CRIT {
 			messages = append(messages, msg.Message)
 		}
@@ -88,16 +91,24 @@ type SendTxArgs struct {
 	MaxPriorityFeePerGas *hexutil.Big             `json:"maxPriorityFeePerGas"`
 	Value                hexutil.Big              `json:"value"`
 	Nonce                hexutil.Uint64           `json:"nonce"`
-
 	// We accept "data" and "input" for backwards-compatibility reasons.
 	// "input" is the newer name and should be preferred by clients.
 	// Issue detail: https://github.com/ethereum/go-ethereum/issues/15628
-	Data  *hexutil.Bytes `json:"data"`
+	Data  *hexutil.Bytes `json:"data,omitempty"`
 	Input *hexutil.Bytes `json:"input,omitempty"`
 
 	// For non-legacy transactions
 	AccessList *types.AccessList `json:"accessList,omitempty"`
 	ChainID    *hexutil.Big      `json:"chainId,omitempty"`
+
+	// For BlobTxType
+	BlobFeeCap *hexutil.Big  `json:"maxFeePerBlobGas,omitempty"`
+	BlobHashes []common.Hash `json:"blobVersionedHashes,omitempty"`
+
+	// For BlobTxType transactions with blob sidecar
+	Blobs       []kzg4844.Blob       `json:"blobs,omitempty"`
+	Commitments []kzg4844.Commitment `json:"commitments,omitempty"`
+	Proofs      []kzg4844.Proof      `json:"proofs,omitempty"`
 }
 
 func (args SendTxArgs) String() string {
@@ -106,6 +117,17 @@ func (args SendTxArgs) String() string {
 		return string(s)
 	}
 	return err.Error()
+}
+
+// data retrieves the transaction calldata. Input field is preferred.
+func (args *SendTxArgs) data() []byte {
+	if args.Input != nil {
+		return *args.Input
+	}
+	if args.Data != nil {
+		return *args.Data
+	}
+	return nil
 }
 
 // ToTransaction converts the arguments to a transaction.
@@ -117,15 +139,34 @@ func (args *SendTxArgs) ToTransaction() *types.Transaction {
 		to = &dstAddr
 	}
 
-	var input []byte
-	if args.Input != nil {
-		input = *args.Input
-	} else if args.Data != nil {
-		input = *args.Data
-	}
-
 	var data types.TxData
 	switch {
+	case args.BlobHashes != nil:
+		al := types.AccessList{}
+		if args.AccessList != nil {
+			al = *args.AccessList
+		}
+		data = &types.BlobTx{
+			To:         *to,
+			ChainID:    uint256.MustFromBig((*big.Int)(args.ChainID)),
+			Nonce:      uint64(args.Nonce),
+			Gas:        uint64(args.Gas),
+			GasFeeCap:  uint256.MustFromBig((*big.Int)(args.MaxFeePerGas)),
+			GasTipCap:  uint256.MustFromBig((*big.Int)(args.MaxPriorityFeePerGas)),
+			Value:      uint256.MustFromBig((*big.Int)(&args.Value)),
+			Data:       args.data(),
+			AccessList: al,
+			BlobHashes: args.BlobHashes,
+			BlobFeeCap: uint256.MustFromBig((*big.Int)(args.BlobFeeCap)),
+		}
+		if args.Blobs != nil {
+			data.(*types.BlobTx).Sidecar = &types.BlobTxSidecar{
+				Blobs:       args.Blobs,
+				Commitments: args.Commitments,
+				Proofs:      args.Proofs,
+			}
+		}
+
 	case args.MaxFeePerGas != nil:
 		al := types.AccessList{}
 		if args.AccessList != nil {
@@ -139,7 +180,7 @@ func (args *SendTxArgs) ToTransaction() *types.Transaction {
 			GasFeeCap:  (*big.Int)(args.MaxFeePerGas),
 			GasTipCap:  (*big.Int)(args.MaxPriorityFeePerGas),
 			Value:      (*big.Int)(&args.Value),
-			Data:       input,
+			Data:       args.data(),
 			AccessList: al,
 		}
 	case args.AccessList != nil:
@@ -150,7 +191,7 @@ func (args *SendTxArgs) ToTransaction() *types.Transaction {
 			Gas:        uint64(args.Gas),
 			GasPrice:   (*big.Int)(args.GasPrice),
 			Value:      (*big.Int)(&args.Value),
-			Data:       input,
+			Data:       args.data(),
 			AccessList: *args.AccessList,
 		}
 	default:
@@ -160,7 +201,7 @@ func (args *SendTxArgs) ToTransaction() *types.Transaction {
 			Gas:      uint64(args.Gas),
 			GasPrice: (*big.Int)(args.GasPrice),
 			Value:    (*big.Int)(&args.Value),
-			Data:     input,
+			Data:     args.data(),
 		}
 	}
 	return types.NewTx(data)
@@ -269,16 +310,8 @@ func (typedData *TypedData) HashStruct(primaryType string, data TypedDataMessage
 // Dependencies returns an array of custom types ordered by their hierarchical reference tree
 func (typedData *TypedData) Dependencies(primaryType string, found []string) []string {
 	primaryType = strings.Split(primaryType, "[")[0]
-	includes := func(arr []string, str string) bool {
-		for _, obj := range arr {
-			if obj == str {
-				return true
-			}
-		}
-		return false
-	}
 
-	if includes(found, primaryType) {
+	if slices.Contains(found, primaryType) {
 		return found
 	}
 	if typedData.Types[primaryType] == nil {
@@ -287,7 +320,7 @@ func (typedData *TypedData) Dependencies(primaryType string, found []string) []s
 	found = append(found, primaryType)
 	for _, field := range typedData.Types[primaryType] {
 		for _, dep := range typedData.Dependencies(field.Type, found) {
-			if !includes(found, dep) {
+			if !slices.Contains(found, dep) {
 				found = append(found, dep)
 			}
 		}
@@ -354,9 +387,9 @@ func (typedData *TypedData) EncodeData(primaryType string, data map[string]inter
 		encType := field.Type
 		encValue := data[field.Name]
 		if encType[len(encType)-1:] == "]" {
-			encodedData, encErr := typedData.encodeArrayValue(encValue, encType, depth)
-			if encErr != nil {
-				return nil, encErr
+			encodedData, err := typedData.encodeArrayValue(encValue, encType, depth)
+			if err != nil {
+				return nil, err
 			}
 			buffer.Write(encodedData)
 		} else if typedData.Types[field.Type] != nil {
@@ -386,14 +419,23 @@ func (typedData *TypedData) encodeArrayValue(encValue interface{}, encType strin
 		return nil, dataMismatchError(encType, encValue)
 	}
 
-	arrayBuffer := bytes.Buffer{}
+	arrayBuffer := new(bytes.Buffer)
 	parsedType := strings.Split(encType, "[")[0]
 	for _, item := range arrayValue {
 		if reflect.TypeOf(item).Kind() == reflect.Slice ||
 			reflect.TypeOf(item).Kind() == reflect.Array {
-			encodedData, encErr := typedData.encodeArrayValue(item, parsedType, depth+1)
-			if encErr != nil {
-				return nil, encErr
+			var (
+				encodedData hexutil.Bytes
+				err         error
+			)
+			if reflect.TypeOf(item).Elem().Kind() == reflect.Uint8 {
+				// the item type is bytes.  encode the bytes array directly instead of recursing.
+				encodedData, err = typedData.EncodePrimitiveValue(parsedType, item, depth+1)
+			} else {
+				encodedData, err = typedData.encodeArrayValue(item, parsedType, depth+1)
+			}
+			if err != nil {
+				return nil, err
 			}
 			arrayBuffer.Write(encodedData)
 		} else {
@@ -402,16 +444,16 @@ func (typedData *TypedData) encodeArrayValue(encValue interface{}, encType strin
 				if !ok {
 					return nil, dataMismatchError(parsedType, item)
 				}
-				encodedData, encErr := typedData.EncodeData(parsedType, mapValue, depth+1)
-				if encErr != nil {
-					return nil, encErr
+				encodedData, err := typedData.EncodeData(parsedType, mapValue, depth+1)
+				if err != nil {
+					return nil, err
 				}
 				digest := crypto.Keccak256(encodedData)
 				arrayBuffer.Write(digest)
 			} else {
-				bytesValue, encErr := typedData.EncodePrimitiveValue(parsedType, item, depth)
-				if encErr != nil {
-					return nil, encErr
+				bytesValue, err := typedData.EncodePrimitiveValue(parsedType, item, depth)
+				if err != nil {
+					return nil, err
 				}
 				arrayBuffer.Write(bytesValue)
 			}
@@ -719,11 +761,11 @@ func formatPrimitiveValue(encType string, encValue interface{}) (string, error) 
 	return "", fmt.Errorf("unhandled type %v", encType)
 }
 
-// Validate checks if the types object is conformant to the specs
+// validate checks if the types object is conformant to the specs
 func (t Types) validate() error {
 	for typeKey, typeArr := range t {
 		if len(typeKey) == 0 {
-			return fmt.Errorf("empty type key")
+			return errors.New("empty type key")
 		}
 		for i, typeObj := range typeArr {
 			if len(typeObj.Type) == 0 {
